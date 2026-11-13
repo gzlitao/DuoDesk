@@ -31,9 +31,9 @@ permissions:
 
 jobs:
   build:
-    # macos-14 / macos-latest 是 Apple Silicon runner；x64 靠交叉编译（README 明说不需 Intel 机器）。
+    # macos-15 / macos-latest 是 Apple Silicon runner；x64 靠交叉编译（README 明说不需 Intel 机器）。
     # 想用真 Intel runner 改成 macos-13（Xcode 版本更旧，偶发 Swift 兼容问题，一般不必）。
-    runs-on: macos-14
+    runs-on: macos-15-intel
     timeout-minutes: 60
 
     steps:
