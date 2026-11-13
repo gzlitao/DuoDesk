@@ -1,0 +1,160 @@
+name: Build macOS Intel (x64)
+
+# 放在你 fork 的 .github/workflows/ 下，然后 Actions › Build macOS Intel (x64) › Run workflow。
+# 产物：run 页面底部的 Artifact（duodesk-macos-x64-dmg），或直接挂到指定 Release。
+#
+# 签名/公证是可选的，secret 名与上游 build-mac.yml 完全一致：
+#   DEVELOPER_ID_CERTIFICATE_BASE64   base64 -i DeveloperID.p12 | pbcopy
+#   DEVELOPER_ID_CERTIFICATE_PASSWORD p12 的导出密码
+#   APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID
+# 虚拟摄像头系统扩展（可选）：
+#   MAC_APP_PROFILE_BASE64 / MAC_CAMERA_PROFILE_BASE64
+# 不配 keychain 也能跑，出 ad-hoc 签名的包，用户首次打开手动放行。
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '挂到哪个 Release（如 v2.5.0-x64；不存在会自动建 draft）。留空只上传 Artifact'
+        required: false
+        default: ''
+      ref:
+        description: '要构建的分支'
+        required: false
+        default: 'main'
+
+env:
+  TAG: ${{ inputs.tag || '' }}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macos-14 / macos-latest 是 Apple Silicon runner；x64 靠交叉编译（README 明说不需 Intel 机器）。
+    # 想用真 Intel runner 改成 macos-13（Xcode 版本更旧，偶发 Swift 兼容问题，一般不必）。
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'main' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: mac/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Configure Developer ID certificate (if secret provided)
+        id: signing-setup
+        env:
+          DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$DEVELOPER_ID_CERTIFICATE_BASE64" ]; then
+            echo "没有证书 secret，构建 ad-hoc 签名的包"
+            exit 0
+          fi
+          KEYCHAIN_PATH="${RUNNER_TEMP}/duodesk-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          CERT_PATH="${RUNNER_TEMP}/certificate.p12"
+
+          echo "$DEVELOPER_ID_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          existing_keychains=()
+          while IFS= read -r kc; do
+            existing_keychains+=("${kc//\"/}")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$KEYCHAIN_PATH" "${existing_keychains[@]}"
+
+          security import "$CERT_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "${DEVELOPER_ID_CERTIFICATE_PASSWORD:-}" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          ID="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk '/Developer ID Application/ && !id {id=$2} END {print id}')"
+          rm -f "$CERT_PATH"
+          if [ -n "$ID" ]; then
+            echo "MAC_IDENTITY=$ID" >> "$GITHUB_ENV"
+            echo "SIGNING_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+            echo "签名身份：$ID"
+          else
+            echo "::warning::导入的证书里没有 Developer ID Application 身份，按未签名构建"
+          fi
+
+      - name: Install dependencies
+        working-directory: mac
+        run: npm install
+
+      - name: Render the disk image background
+        working-directory: mac
+        run: sh dmg/make-background.sh || echo "::warning::沿用仓库里已提交的 dmg/background.tiff"
+
+      # dmg:intel = build-app.sh x64（交叉编 Swift helper + 塞 x64 Electron 运行时）&& build-dmg.sh
+      # build-dmg.sh 在 MAC_IDENTITY 存在且给了 Apple 凭据时会 codesign dmg → notarytool --wait → stapler staple
+      - name: Build Intel app and disk image
+        working-directory: mac
+        run: |
+          if [ -n "$MAC_APP_PROFILE_BASE64" ] && [ -n "$MAC_CAMERA_PROFILE_BASE64" ]; then
+            echo "$MAC_APP_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/app.provisionprofile"
+            echo "$MAC_CAMERA_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/camera.provisionprofile"
+            export MAC_APP_PROFILE="$RUNNER_TEMP/app.provisionprofile" MAC_CAMERA_PROFILE="$RUNNER_TEMP/camera.provisionprofile"
+          fi
+          npm run dmg:intel
+        env:
+          MAC_APP_PROFILE_BASE64: ${{ secrets.MAC_APP_PROFILE_BASE64 }}
+          MAC_CAMERA_PROFILE_BASE64: ${{ secrets.MAC_CAMERA_PROFILE_BASE64 }}
+          MAC_IDENTITY: ${{ env.MAC_IDENTITY || secrets.MAC_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify it is really x86_64
+        working-directory: mac
+        run: |
+          VER=$(node -p "require('./package.json').version")
+          DMG="dist/DuoDesk-${VER}-x64.dmg"
+          test -f "$DMG" || { echo "::error::没找到 $DMG"; ls -l dist; exit 1; }
+          lipo -archs dist/DuoDesk.app/Contents/MacOS/DuoDesk | grep -qx 'x86_64' \
+            || { echo "::error::架构不是纯 x86_64：$(lipo -archs dist/DuoDesk.app/Contents/MacOS/DuoDesk)"; exit 1; }
+          echo "架构 OK：$(lipo -archs dist/DuoDesk.app/Contents/MacOS/DuoDesk)"
+          codesign -dv --verbose=4 dist/DuoDesk.app 2>&1 | grep -E 'Authority|TeamIdentifier|flags' || true
+          if [ -n "$MAC_IDENTITY" ]; then
+            spctl -a -vvv -t install "$DMG" 2>&1 || echo "::warning::Gatekeeper 评估未通过（可能未公证）"
+          fi
+
+      - name: Cleanup signing keychain
+        if: always()
+        run: |
+          if [ -n "$SIGNING_KEYCHAIN_PATH" ] && [ -f "$SIGNING_KEYCHAIN_PATH" ]; then
+            security delete-keychain "$SIGNING_KEYCHAIN_PATH" || true
+          fi
+
+      - name: Upload Intel DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: duodesk-macos-x64-dmg
+          path: mac/dist/*-x64.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload to the release
+        if: env.TAG != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --draft --prerelease --target "$(git rev-parse HEAD)" --title "$TAG" --notes ""
+          gh release upload "$TAG" mac/dist/*-x64.dmg --clobber
